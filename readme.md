@@ -19,3 +19,9 @@ For Production use SMTP providers:
 
 For Development and this repo:
 - https://mailtrap.io/
+
+# Tokens:
+
+Access Token = 15 minutes - Determines how long User is logged in
+Refresh Token = 60 minutes - usually used to request an Access Token
+Refresh and Access tokens are stored in response cookies (`response.set_cookie`)
