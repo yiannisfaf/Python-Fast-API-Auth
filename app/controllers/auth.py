@@ -1,4 +1,6 @@
 from datetime import timedelta
+import hashlib
+from random import randbytes
 from fastapi import APIRouter, Request, Response, status, Depends, HTTPException
 from pydantic import EmailStr
 
@@ -8,6 +10,7 @@ from sqlalchemy.orm import Session
 from ..database import get_db
 from app.oauth2 import AuthJWT
 from ..config import settings
+from ..email import Email
 
 
 router = APIRouter()
@@ -15,11 +18,12 @@ ACCESS_TOKEN_EXPIRES_IN = settings.ACCESS_TOKEN_EXPIRES_IN
 REFRESH_TOKEN_EXPIRES_IN = settings.REFRESH_TOKEN_EXPIRES_IN
 
 
-@router.post('/register', status_code=status.HTTP_201_CREATED, response_model=schemas.UserResponse)
-async def create_user(payload: schemas.CreateUserSchema, db: Session = Depends(get_db)):
+@router.post('/register', status_code=status.HTTP_201_CREATED)
+async def create_user(payload: schemas.CreateUserSchema, request: Request, db: Session = Depends(get_db)):
     # Check if user already exist
-    user = db.query(models.User).filter(
-        models.User.email == EmailStr(payload.email.lower())).first()
+    user_query = db.query(models.User).filter(
+        models.User.email == EmailStr(payload.email.lower()))
+    user = user_query.first()
     if user:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT,
                             detail='Account already exist')
@@ -31,13 +35,33 @@ async def create_user(payload: schemas.CreateUserSchema, db: Session = Depends(g
     payload.password = utils.hash_password(payload.password)
     del payload.passwordConfirm
     payload.role = 'user'
-    payload.verified = True
+    payload.verified = False
     payload.email = EmailStr(payload.email.lower())
     new_user = models.User(**payload.dict())
     db.add(new_user)
     db.commit()
     db.refresh(new_user)
-    return new_user
+
+    try:
+        # Send Verification Email
+        token = randbytes(10)
+        hashedCode = hashlib.sha256()
+        hashedCode.update(token)
+        verification_code = hashedCode.hexdigest()
+        user_query.update(
+            {'verification_code': verification_code}, synchronize_session=False)
+        db.commit()
+        url = f"{request.url.scheme}://{request.client.host}:{request.url.port}/api/auth/verifyemail/{token.hex()}"
+        await Email(new_user, url, [payload.email]).sendVerificationCode()
+    except Exception as error:
+        print('Error', error)
+        user_query.update(
+            {'verification_code': None}, synchronize_session=False)
+        db.commit()
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                            detail='There was an error sending email')
+    return {'status': 'success', 'message': 'Verification token successfully sent to your email'}
+
 
 
 @router.post('/login')
@@ -117,3 +141,26 @@ def logout(response: Response, Authorize: AuthJWT = Depends(), user_id: str = De
 
     return {'status': 'success'}
 
+
+@router.get('/verifyemail/{token}')
+def verify_me(token: str, db: Session = Depends(get_db)):
+    hashedCode = hashlib.sha256()
+    hashedCode.update(bytes.fromhex(token))
+    verification_code = hashedCode.hexdigest()
+    user_query = db.query(models.User).filter(
+        models.User.verification_code == verification_code)
+    db.commit()
+    user = user_query.first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Invalid code or user doesn't exist")
+    if user.verified:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail='Email can only be verified once')
+    user_query.update(
+        {'verified': True, 'verification_code': None}, synchronize_session=False)
+    db.commit()
+    return {
+        "status": "success",
+        "message": "Account verified successfully"
+    }
